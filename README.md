@@ -41,6 +41,22 @@ C:\Users\33922\Desktop\Hermes\
 - 已连接麦克风
 - Python 3.11（虚拟环境已配好，`ss13-voice\venv\`）
 
+### 第〇步：配置 API 密钥
+
+语音识别使用百度短语音识别 API，首次使用需要配置密钥：
+
+1. 打开 https://console.bce.baidu.com/ai/#/ai/speech/overview
+2. 登录百度账号 → 「语音技术」→「短语音识别」→「创建应用」
+3. 获取 **API Key** 和 **Secret Key**（免费额度 5 万次/天）
+4. 双击项目里的 **`配置API.bat`** → 粘贴密钥 → 自动验证连接
+
+或者手动创建 `.env` 文件（参照 `.env.example`）：
+
+```ini
+BAIDU_API_KEY=你的API_Key
+BAIDU_SECRET_KEY=你的Secret_Key
+```
+
 ### 第一步：校准点击位置
 
 双击 `校准点击位置.bat`：
