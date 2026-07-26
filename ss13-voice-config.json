@@ -1,0 +1,16 @@
+{
+  "mic_device": 0,
+  "mic_device_name": "[0] Microsoft 声音映射器 - Input",
+  "ptt_key": {
+    "type": "special",
+    "name": "caps_lock"
+  },
+  "ptt_key_display": "CapsLock",
+  "click_offset_x": 215,
+  "click_offset_y": 14,
+  "click_wait_ms": 150,
+  "window_geometry": "680x525+653+194",
+  "window_topmost": true,
+  "auto_open_t": true,
+  "auto_send_enter": true
+}

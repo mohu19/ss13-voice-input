@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Vosk model (large, user downloads separately)
+vosk-model-small-cn-0.22/
+vosk-model-small-cn-0.22.zip
+
+# Backups
+*.bak
+
+# Logs
+*.log
