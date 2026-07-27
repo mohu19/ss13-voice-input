@@ -1,33 +1,16 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-venv/
-
 # User config (not committed)
 api.txt
 calibrate.txt
 .env
-
-# OS
+__pycache__/
+*.pyc
+*.pyo
+venv/
 Thumbs.db
 .DS_Store
-
-# IDE
 .vscode/
 .idea/
-
-# Vosk model (large, user downloads separately)
-vosk-model-small-cn-0.22/
-vosk-model-small-cn-0.22.zip
-
-# Backups
 *.bak
-
-# Logs
 *.log
-
-# PyInstaller build artifacts
-dist/
 build/
 *.spec

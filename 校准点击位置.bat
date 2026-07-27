@@ -1,4 +1,3 @@
 @echo off
 cd /d "%~dp0"
-python -u ss13-voice-input.py --calibrate
-pause
+start "" "dist\SS13-Voice-Input.exe" --calibrate
