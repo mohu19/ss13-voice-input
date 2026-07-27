@@ -1,5 +1,4 @@
-"""
-SS13 Voice Input - Push to Talk (Baidu ASR + Vosk)
+"""SS13 Voice Input - Push to Talk (Baidu ASR + Vosk)
 带设置窗口的语音输入工具
 
 功能：
@@ -7,6 +6,7 @@ SS13 Voice Input - Push to Talk (Baidu ASR + Vosk)
 - 麦克风选择
 - PTT 键自定义绑定（捕获按键 + 预设列表）
 - 置顶开关
+- API 密钥配置（窗口内直接填）
 - 窗口大小可调
 - 设置自动保存
 """
@@ -20,28 +20,20 @@ import mouse as mouse_lib
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-# ── 百度 ASR 配置（从 .env 读取） ──
-BAIDU_API_KEY = ""
-BAIDU_SECRET_KEY = ""
-_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-if os.path.exists(_env_path):
-    with open(_env_path, "r", encoding="utf-8") as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if _line and not _line.startswith("#"):
-                if "=" in _line:
-                    _k, _v = _line.split("=", 1)
-                    _k, _v = _k.strip(), _v.strip()
-                    if _k == "BAIDU_API_KEY": BAIDU_API_KEY = _v
-                    if _k == "BAIDU_SECRET_KEY": BAIDU_SECRET_KEY = _v
+# ── 常量 ──
 BAIDU_TOKEN_URL = "https://aip.baidubce.com/oauth/2.0/token"
 BAIDU_ASR_URL = "http://vop.baidu.com/server_api"
-DEV_PID = 15372  # 普通话（远场），1537是输入法模型场景
+DEV_PID = 1537  # 普通话（近场），旧版 15372 已被百度废弃
 CUID = "ss13-voice-input-win10"
+VERSION = "v7.1-ready"
 
 # ── 路径 ──
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, 'frozen', False):
+    SCRIPT_DIR = os.path.dirname(sys.executable)
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "ss13-voice-config.json")
+API_FILE_PATH = os.path.join(os.path.dirname(SCRIPT_DIR) if getattr(sys, 'frozen', False) else SCRIPT_DIR, "api.txt")
+CALIBRATE_FILE_PATH = os.path.join(os.path.dirname(SCRIPT_DIR) if getattr(sys, 'frozen', False) else SCRIPT_DIR, "calibrate.txt")
 VOSK_MODEL_PATH = os.path.join(SCRIPT_DIR, "vosk-model-small-cn-0.22")
 SAMPLE_RATE = 16000
 
@@ -55,10 +47,7 @@ def load_config() -> dict:
         "mic_device_name": "默认设备",
         "ptt_key": {"type": "special", "name": "caps_lock"},
         "ptt_key_display": "CapsLock",
-        "click_offset_x": None,
-        "click_offset_y": 25,
-        "click_wait_ms": 150,
-        "window_geometry": "680x520",
+        "window_geometry": "680x640",
         "window_topmost": True,
         "auto_open_t": False,
         "auto_send_enter": False,
@@ -76,22 +65,64 @@ def save_config(cfg):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
+# ── api.txt 读写 ──
+
+def load_api_from_file() -> tuple:
+    """从 api.txt 读取 API Key 和 Secret Key，返回 (ak, sk)"""
+    if not os.path.exists(API_FILE_PATH):
+        return ("", "")
+    try:
+        with open(API_FILE_PATH, "r", encoding="utf-8") as f:
+            lines = f.read().strip().splitlines()
+        if len(lines) >= 2:
+            return (lines[0].strip(), lines[1].strip())
+        return ("", "")
+    except Exception:
+        return ("", "")
+
+def save_api_to_file(ak: str, sk: str):
+    with open(API_FILE_PATH, "w", encoding="utf-8") as f:
+        f.write(f"{ak}\n{sk}\n")
+
+# ── calibrate.txt 读写 ──
+
+DEFAULT_CLICK_OFFSET_Y = 25
+
+def load_calibrate_from_file() -> tuple:
+    """从 calibrate.txt 读取点击偏移，返回 (offset_x, offset_y)"""
+    if not os.path.exists(CALIBRATE_FILE_PATH):
+        return (None, DEFAULT_CLICK_OFFSET_Y)
+    try:
+        with open(CALIBRATE_FILE_PATH, "r", encoding="utf-8") as f:
+            lines = f.read().strip().splitlines()
+        if len(lines) >= 2:
+            return (int(lines[0].strip()), int(lines[1].strip()))
+        return (None, DEFAULT_CLICK_OFFSET_Y)
+    except Exception:
+        return (None, DEFAULT_CLICK_OFFSET_Y)
+
+def save_calibrate_to_file(ox: int, oy: int):
+    with open(CALIBRATE_FILE_PATH, "w", encoding="utf-8") as f:
+        f.write(f"{ox}\n{oy}\n")
+
 # ═══════════════════════════════════════════
-# 百度 ASR
+# 百度 ASR（API key 由调用方传入）
 # ═══════════════════════════════════════════
 
 _access_token = None
 _token_expiry = 0.0
 
-def _get_access_token() -> str:
+def _get_access_token(api_key: str, secret_key: str) -> str:
     global _access_token, _token_expiry
+    if not api_key or not secret_key:
+        return ""
     now = time.time()
     if _access_token and now < _token_expiry - 300:
         return _access_token
     params = urllib.parse.urlencode({
         "grant_type": "client_credentials",
-        "client_id": BAIDU_API_KEY,
-        "client_secret": BAIDU_SECRET_KEY,
+        "client_id": api_key,
+        "client_secret": secret_key,
     })
     url = f"{BAIDU_TOKEN_URL}?{params}"
     req = urllib.request.Request(url, method="POST")
@@ -102,12 +133,33 @@ def _get_access_token() -> str:
             expires_in = data.get("expires_in", 2592000)
             _token_expiry = now + expires_in
             return _access_token
-    except Exception as e:
+    except Exception:
         return ""
 
-def _baidu_asr(audio_bytes: bytes) -> str:
-    token = _get_access_token()
+def verify_api(api_key: str, secret_key: str) -> str:
+    """验证 API 密钥，成功返回空字符串，失败返回错误信息"""
+    if not api_key or not secret_key:
+        return "API Key 和 Secret Key 不能为空"
+    params = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": api_key,
+        "client_secret": secret_key,
+    })
+    url = f"{BAIDU_TOKEN_URL}?{params}"
+    req = urllib.request.Request(url, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("access_token"):
+                return ""
+            return data.get("error_description", "未知错误")
+    except Exception as e:
+        return f"网络错误: {e}"
+
+def _baidu_asr(audio_bytes: bytes, api_key: str, secret_key: str, log_func=None) -> str:
+    token = _get_access_token(api_key, secret_key)
     if not token:
+        if log_func: log_func("! 百度 token 获取失败（检查 API Key/Secret Key 或网络）")
         return ""
     params = urllib.parse.urlencode({"dev_pid": DEV_PID, "cuid": CUID, "token": token})
     url = f"{BAIDU_ASR_URL}?{params}"
@@ -116,12 +168,23 @@ def _baidu_asr(audio_bytes: bytes) -> str:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             result = json.loads(resp.read().decode("utf-8"))
-            if result.get("err_no") == 0:
+            err_no = result.get("err_no", -1)
+            if err_no == 0:
                 texts = result.get("result", [])
                 if texts:
                     return texts[0].strip()
+            else:
+                err_msg = result.get("err_msg", "未知错误")
+                if log_func: log_func(f"! 百度 ASR 返回错误 [{err_no}]: {err_msg}")
             return ""
-    except Exception:
+    except urllib.error.HTTPError as e:
+        if log_func: log_func(f"! 百度 ASR HTTP 错误: {e.code} {e.reason}")
+        return ""
+    except urllib.error.URLError as e:
+        if log_func: log_func(f"! 百度 ASR 网络错误: {e.reason}")
+        return ""
+    except Exception as e:
+        if log_func: log_func(f"! 百度 ASR 未知错误: {e}")
         return ""
 
 def _vosk_asr(recognizer, audio_bytes: bytes) -> str:
@@ -176,13 +239,11 @@ def find_tgui_say_cef():
         return cef_hwnd, win32gui.GetWindowRect(cef_hwnd), win32gui.GetClassName(cef_hwnd)
     return None, None, None
 
-
-# ── 键盘辅助（SendInput 物理按键，用于自动按 T 和 Enter） ──
+# ── 键盘辅助 ──
 VK_T = 0x54
 VK_RETURN = 0x0D
 
 def press_key(vk_code: int, duration=0.08):
-    """SendInput 物理按键 + PostMessage 前台窗口兜底"""
     user32 = ctypes.windll.user32
     INPUT_KEYBOARD = 1
     KEYEVENTF_KEYUP = 0x0002
@@ -199,7 +260,6 @@ def press_key(vk_code: int, duration=0.08):
     scan_map = {VK_T: 0x14, VK_RETURN: 0x1C}
     scan = scan_map.get(vk_code, 0)
 
-    # SendInput（OS级物理按键）
     inp_down = INPUT(INPUT_KEYBOARD, KEYBDINPUT(vk_code, scan, 0, 0, 0))
     inp_up = INPUT(INPUT_KEYBOARD, KEYBDINPUT(vk_code, scan, KEYEVENTF_KEYUP, 0, 0))
     user32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT))
@@ -207,13 +267,11 @@ def press_key(vk_code: int, duration=0.08):
     user32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT))
     time.sleep(0.03)
 
-    # PostMessage 到前台窗口（兜底）
     fg_hwnd = user32.GetForegroundWindow()
     if fg_hwnd:
-        user32.PostMessageW(fg_hwnd, 0x100, vk_code, 0)  # WM_KEYDOWN
+        user32.PostMessageW(fg_hwnd, 0x100, vk_code, 0)
         time.sleep(0.02)
-        user32.PostMessageW(fg_hwnd, 0x101, vk_code, 0)  # WM_KEYUP
-
+        user32.PostMessageW(fg_hwnd, 0x101, vk_code, 0)
 
 def click_and_fill(text: str, cfg: dict, log_func) -> bool:
     cef_hwnd, cef_rect, cef_class = find_tgui_say_cef()
@@ -223,25 +281,22 @@ def click_and_fill(text: str, cfg: dict, log_func) -> bool:
     left, top, right, bottom = cef_rect
     w = right - left
     h = bottom - top
-    ox = cfg.get("click_offset_x")
-    oy = cfg.get("click_offset_y", 25)
+    ox, oy = load_calibrate_from_file()
     click_x = left + (ox if ox is not None else w // 2)
     click_y = top + oy
-    wait = cfg.get("click_wait_ms", 150) / 1000.0
+    wait = 0.150
 
     log_func(f"🖱 点击 ({click_x}, {click_y}) 等待 {wait*1000:.0f}ms")
     mouse_lib.move(click_x, click_y)
     mouse_lib.click()
     time.sleep(wait)
 
-    # ── WM_CHAR 逐字输入（已反复验证 100% 能进框） ──
     for ch in text:
         win32gui.PostMessage(cef_hwnd, win32con.WM_CHAR, ord(ch), 0)
         time.sleep(0.003)
 
     time.sleep(0.05)
 
-    # 自动按回车发送（PostMessage WM_KEYDOWN/UP → 开发小结证实此方案可发送）
     if cfg.get("auto_send_enter", False):
         log_func("↩ 自动发送")
         win32gui.PostMessage(cef_hwnd, win32con.WM_KEYDOWN, VK_RETURN, 0)
@@ -344,23 +399,29 @@ class VoiceEngine:
         if not self._audio_data:
             return
         audio = np.concatenate(self._audio_data)
+        duration_ms = len(audio) / SAMPLE_RATE * 1000
         if len(audio) < SAMPLE_RATE * 0.3:
+            self.log(f"(录音太短: {duration_ms:.0f}ms，需至少 300ms)")
             return
+        self.log(f"☁ 识别中 ({duration_ms:.0f}ms 音频)...", end="")
         audio_bytes = audio.tobytes()
-        text = ""
-        self.log("☁ 百度识别中...", end="")
-        text = _baidu_asr(audio_bytes)
+
+        api_key, secret_key = load_api_from_file()
+        if api_key and secret_key:
+            text = _baidu_asr(audio_bytes, api_key, secret_key, log_func=self.log)
+        else:
+            self.log("⚠ API 密钥未配置，跳过在线识别", end="")
+
         if not text and self._vosk_available:
             self.log(" ↻ Vosk 回退...", end="")
             text = _vosk_asr(self._vosk_recognizer, audio_bytes)
         if text:
             self.log(f"📝 识别结果: \"{text}\"")
 
-            # 自动按 T 打开聊天
             if self.cfg.get("auto_open_t", False):
                 self.log("⌨ 自动按 T 打开聊天")
                 press_key(VK_T)
-                time.sleep(0.4)  # 等 tgui_say 窗口出现
+                time.sleep(0.4)
 
             click_and_fill(text, self.cfg, self.log)
         else:
@@ -391,6 +452,7 @@ class VoiceEngine:
         ptt_type = self.cfg.get("ptt_key",{}).get("type","special")
         key_display = self.cfg.get("ptt_key_display","CapsLock")
         self.log(f"🎮 语音输入已启动 (PTT: {key_display})")
+        self._log_api_status()
 
         if ptt_type == "mouse":
             mouse_lib.hook(self._on_mouse_event)
@@ -404,6 +466,14 @@ class VoiceEngine:
 
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def _log_api_status(self):
+        ak, sk = load_api_from_file()
+        if ak and sk:
+            masked = ak[:4] + "****" + ak[-4:] if len(ak) > 8 else "****"
+            self.log(f"🔑 百度 API: {masked}")
+        else:
+            self.log("⚠ 百度 API 未配置 — 在「API 配置」中填入密钥启用在线识别")
 
     def _run(self):
         pressed = False
@@ -431,7 +501,6 @@ class VoiceEngine:
             self._audio_stream.close()
 
     def update_config(self, cfg):
-        """运行时更新配置（下次按键时生效）"""
         self.cfg = cfg
         self._ptt_key = self._resolve_key()
 
@@ -446,19 +515,17 @@ class MainWindow:
         self._captured_key = None
 
         self.root = tk.Tk()
-        self.root.title("SS13 语音输入")
-        self.cfg.setdefault("window_geometry", "680x520")
+        self.root.title(f"SS13 语音输入 {VERSION}")
+        self.cfg.setdefault("window_geometry", "680x640")
         self.root.geometry(self.cfg["window_geometry"])
-        self.root.minsize(500, 350)
+        self.root.minsize(500, 500)
         self.root.configure(bg="#2b2b2b")
 
-        # 置顶
         topmost = self.cfg.get("window_topmost", True)
         self.root.attributes("-topmost", topmost)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Escape>", lambda e: self.root.attributes("-topmost", False))
 
-        # 配色
         bg = "#2b2b2b"
         fg = "#e0e0e0"
         sel_bg = "#404040"
@@ -474,14 +541,14 @@ class MainWindow:
         style.map("TCombobox", fieldbackground=[("readonly", sel_bg)],
                   foreground=[("readonly", fg)])
 
-        # ── 主布局：上(日志) + 下(设置) ──
+        # ── 主布局：上(日志) + 中(设置) + 下(API) ──
         main = tk.Frame(self.root, bg=bg)
         main.pack(fill="both", expand=True, padx=10, pady=10)
 
         # ── 日志区域 ──
         log_frame = tk.LabelFrame(main, text=" 运行日志 ", font=("Microsoft YaHei", 9),
                                   bg=bg, fg=fg, relief="groove", padx=6, pady=4)
-        log_frame.pack(fill="both", expand=True, pady=(0, 8))
+        log_frame.pack(fill="both", expand=True, pady=(0, 6))
 
         self._log_text = tk.Text(log_frame, font=("Consolas", 10),
                                  bg="#1e1e1e", fg="#ccc", insertbackground="#ccc",
@@ -497,112 +564,191 @@ class MainWindow:
         settings_frame = tk.Frame(main, bg=bg)
         settings_frame.pack(fill="x")
 
-        # 第1行：麦克风 + PTT键
+        # ── 第1行：麦克风 ──
         row1 = tk.Frame(settings_frame, bg=bg)
-        row1.pack(fill="x", pady=(0, 6))
+        row1.pack(fill="x", pady=(0, 4))
 
-        # 麦克风
+        self._key_var = tk.StringVar(value=self.cfg.get("ptt_key_display", "CapsLock"))
         tk.Label(row1, text="麦克风:", font=("Microsoft YaHei", 9),
                  bg=bg, fg=fg).pack(side="left", padx=(0, 6))
         self._devices = self._get_input_devices()
         self._dev_names = [d["label"] for d in self._devices]
         self._mic_var = tk.StringVar(value=self._find_current_device_label())
         mic_combo = ttk.Combobox(row1, textvariable=self._mic_var,
-                                 values=self._dev_names, state="readonly", width=50)
-        mic_combo.pack(side="left", padx=(0, 16))
+                                 values=self._dev_names, state="readonly")
+        mic_combo.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
-        # PTT键
-        tk.Label(row1, text="PTT键:", font=("Microsoft YaHei", 9),
+        self._status_var = tk.StringVar(value=self._build_summary())
+        status_label = tk.Label(row1, textvariable=self._status_var,
+                                font=("Microsoft YaHei", 9),
+                                bg="#1e1e1e", fg="#aaa",
+                                relief="sunken", bd=1,
+                                anchor="w", padx=6, pady=2)
+        status_label.pack(side="left", padx=(0, 0))
+
+        # ── 第2行：PTT键 ──
+        row2 = tk.Frame(settings_frame, bg=bg)
+        row2.pack(fill="x", pady=(0, 4))
+
+        tk.Label(row2, text="PTT键:", font=("Microsoft YaHei", 9),
                  bg=bg, fg=fg).pack(side="left", padx=(0, 6))
-        self._key_var = tk.StringVar(value=self.cfg.get("ptt_key_display", "CapsLock"))
-        key_entry = tk.Entry(row1, textvariable=self._key_var,
+        key_entry = tk.Entry(row2, textvariable=self._key_var,
                              font=("Consolas", 12, "bold"),
-                             width=12, justify="center",
+                             width=10, justify="center",
                              bg=sel_bg, fg=accent, relief="solid", bd=1,
                              state="readonly")
-        key_entry.pack(side="left", padx=(0, 6), ipady=2)
+        key_entry.pack(side="left", padx=(0, 4), ipady=2)
 
-        self._capture_btn = tk.Button(row1, text="🎯 捕获",
-                                      font=("Microsoft YaHei", 9),
-                                      bg=accent, fg="white", relief="flat",
-                                      padx=10, cursor="hand2",
-                                      command=self._start_capture)
-        self._capture_btn.pack(side="left", padx=(0, 6))
+        self._capture_btn = tk.Button(row2, text="🎯 捕获",
+                                       font=("Microsoft YaHei", 9),
+                                       bg=accent, fg="white", relief="flat",
+                                       padx=8, cursor="hand2",
+                                       command=self._start_capture)
+        self._capture_btn.pack(side="left", padx=(0, 4))
 
+        tk.Label(row2, text="预设:", font=("Microsoft YaHei", 9),
+                 bg=bg, fg=fg).pack(side="left", padx=(0, 2))
         self._preset_var = tk.StringVar()
-        preset_combo = ttk.Combobox(row1, textvariable=self._preset_var,
+        preset_combo = ttk.Combobox(row2, textvariable=self._preset_var,
                                     values=[k[0] for k in COMMON_KEYS],
-                                    state="readonly", width=16)
+                                    state="readonly", width=14)
         preset_combo.pack(side="left")
         preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
 
-        # 第2行：置顶开关 + 保存 + 状态摘要
-        row2 = tk.Frame(settings_frame, bg=bg)
-        row2.pack(fill="x")
+        # ── 第3行：开关 + 偏移 + 按钮 ──
+        row3 = tk.Frame(settings_frame, bg=bg)
+        row3.pack(fill="x", pady=(0, 6))
 
         self._topmost_var = tk.BooleanVar(value=topmost)
-        topmost_cb = tk.Checkbutton(row2, text="置顶窗口",
+        topmost_cb = tk.Checkbutton(row3, text="置顶",
                                     variable=self._topmost_var,
                                     font=("Microsoft YaHei", 9),
                                     bg=bg, fg=fg, selectcolor=bg,
                                     activebackground=bg, activeforeground=fg,
                                     cursor="hand2",
                                     command=self._on_topmost_toggle)
-        topmost_cb.pack(side="left", padx=(0, 12))
+        topmost_cb.pack(side="left", padx=(0, 6))
 
-        # 自动按 T（默认关）
         self._auto_t_var = tk.BooleanVar(value=self.cfg.get("auto_open_t", False))
-        auto_t_cb = tk.Checkbutton(row2, text="⏎ 自动T",
+        auto_t_cb = tk.Checkbutton(row3, text="⏎T",
                                    variable=self._auto_t_var,
                                    font=("Microsoft YaHei", 9),
                                    bg=bg, fg=fg, selectcolor=bg,
                                    activebackground=bg, activeforeground=fg,
                                    cursor="hand2",
                                    command=self._on_auto_toggle)
-        auto_t_cb.pack(side="left", padx=(0, 4))
+        auto_t_cb.pack(side="left", padx=(0, 2))
 
-        # 自动回车（默认关）
         self._auto_enter_var = tk.BooleanVar(value=self.cfg.get("auto_send_enter", False))
-        auto_enter_cb = tk.Checkbutton(row2, text="↩ 自动发送",
+        auto_enter_cb = tk.Checkbutton(row3, text="↩发送",
                                        variable=self._auto_enter_var,
                                        font=("Microsoft YaHei", 9),
                                        bg=bg, fg=fg, selectcolor=bg,
                                        activebackground=bg, activeforeground=fg,
                                        cursor="hand2",
                                        command=self._on_auto_toggle)
-        auto_enter_cb.pack(side="left", padx=(0, 12))
+        auto_enter_cb.pack(side="left", padx=(0, 10))
 
-        self._status_var = tk.StringVar(value=self._build_summary())
-        status_label = tk.Label(row2, textvariable=self._status_var,
-                                font=("Microsoft YaHei", 9),
-                                bg="#1e1e1e", fg="#aaa",
-                                relief="sunken", bd=1,
-                                anchor="w", padx=8, pady=4)
-        status_label.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        # 偏移 X/Y 微调
+        _cal_ox, _cal_oy = load_calibrate_from_file()
+        tk.Label(row3, text="偏移", font=("Microsoft YaHei", 9),
+                 bg=bg, fg=fg).pack(side="left", padx=(0, 2))
+        self._cal_ox_var = tk.StringVar(value=str(_cal_ox) if _cal_ox is not None else "居中")
+        cal_ox_spin = tk.Spinbox(row3, from_=0, to=500, textvariable=self._cal_ox_var,
+                                 font=("Consolas", 8), width=4, justify="center",
+                                 bg=sel_bg, fg=fg, buttonbackground=sel_bg,
+                                 relief="solid", bd=1)
+        cal_ox_spin.pack(side="left", padx=(1, 0))
+        tk.Label(row3, text="X", font=("Microsoft YaHei", 8),
+                 bg=bg, fg="#888").pack(side="left")
+        self._cal_oy_var = tk.StringVar(value=str(_cal_oy))
+        cal_oy_spin = tk.Spinbox(row3, from_=0, to=200, textvariable=self._cal_oy_var,
+                                 font=("Consolas", 8), width=4, justify="center",
+                                 bg=sel_bg, fg=fg, buttonbackground=sel_bg,
+                                 relief="solid", bd=1)
+        cal_oy_spin.pack(side="left", padx=(1, 0))
+        tk.Label(row3, text="Y", font=("Microsoft YaHei", 8),
+                 bg=bg, fg="#888").pack(side="left", padx=(0, 8))
 
-        save_btn = tk.Button(row2, text="💾 保存设置",
-                             font=("Microsoft YaHei", 9),
-                             bg=accent, fg="white", relief="flat",
-                             padx=14, cursor="hand2",
-                             command=self._on_save)
-        save_btn.pack(side="right")
-
-        # 校准点击位置按钮（在保存按钮左边）
-        calib_btn = tk.Button(row2, text="🎯 校准点击",
+        calib_btn = tk.Button(row3, text="🎯校准",
                               font=("Microsoft YaHei", 9),
                               bg="#ff9800", fg="white", relief="flat",
-                              padx=10, cursor="hand2",
+                              padx=8, cursor="hand2",
                               command=self._calibrate_click)
-        calib_btn.pack(side="right", padx=(0, 6))
+        calib_btn.pack(side="left", padx=(0, 4))
+
+        save_btn = tk.Button(row3, text="💾保存",
+                             font=("Microsoft YaHei", 9),
+                             bg=accent, fg="white", relief="flat",
+                             padx=10, cursor="hand2",
+                             command=self._on_save)
+        save_btn.pack(side="left", padx=(0, 0))
+
+        # ── API 配置区域 ──
+        api_frame = tk.LabelFrame(settings_frame, text=" API 配置 (百度短语音识别) ",
+                                  font=("Microsoft YaHei", 9),
+                                  bg=bg, fg="#ff9800", relief="groove", padx=8, pady=6)
+        api_frame.pack(fill="x", pady=(0, 6))
+
+        api_row1 = tk.Frame(api_frame, bg=bg)
+        api_row1.pack(fill="x", pady=(0, 4))
+
+        _api_ak, _api_sk = load_api_from_file()
+        tk.Label(api_row1, text="API Key:", font=("Microsoft YaHei", 9),
+                 bg=bg, fg=fg, width=10, anchor="w").pack(side="left")
+        self._api_key_var = tk.StringVar(value=_api_ak)
+        api_key_entry = tk.Entry(api_row1, textvariable=self._api_key_var,
+                                 font=("Consolas", 9), width=55,
+                                 bg="#1e1e1e", fg="#e0e0e0", insertbackground="#e0e0e0",
+                                 relief="sunken", bd=2)
+        api_key_entry.pack(side="left", padx=(0, 8), ipady=2)
+
+        tk.Label(api_row1, text="申请: console.bce.baidu.com",
+                 font=("Microsoft YaHei", 8), bg=bg, fg="#888").pack(side="left")
+
+        api_row2 = tk.Frame(api_frame, bg=bg)
+        api_row2.pack(fill="x", pady=(0, 4))
+
+        tk.Label(api_row2, text="Secret Key:", font=("Microsoft YaHei", 9),
+                 bg=bg, fg=fg, width=10, anchor="w").pack(side="left")
+        self._api_sk_var = tk.StringVar(value=_api_sk)
+        api_sk_entry = tk.Entry(api_row2, textvariable=self._api_sk_var,
+                                font=("Consolas", 9), width=55,
+                                bg="#1e1e1e", fg="#e0e0e0", insertbackground="#e0e0e0",
+                                relief="sunken", bd=2)
+        api_sk_entry.pack(side="left", padx=(0, 8), ipady=2)
+
+        api_test_btn = tk.Button(api_row2, text="验证连接",
+                                 font=("Microsoft YaHei", 9),
+                                 bg="#4CAF50", fg="white", relief="flat",
+                                 padx=12, cursor="hand2",
+                                 command=self._on_api_test)
+        api_test_btn.pack(side="left")
+
+        self._api_status_label = tk.Label(api_row2, text="",
+                                          font=("Microsoft YaHei", 9),
+                                          bg=bg, fg="#aaa", anchor="w")
+        self._api_status_label.pack(side="left", padx=(8, 0))
 
         # ── 启动引擎 ──
-        self._log("SS13 语音输入 v5")
+        ox, oy = load_calibrate_from_file()
+        self._log(f"SS13 语音输入 {VERSION}")
         self._log(f"配置文件: {CONFIG_PATH}")
-        self._log(f"点击偏移: ({self.cfg.get('click_offset_x') or '居中'}, {self.cfg.get('click_offset_y','?')})")
+        self._log(f"点击偏移: ({ox or '居中'}, {oy})")
+        self._log(f"自动模式: {'T' if self.cfg.get('auto_open_t') else '-'}/{'↩' if self.cfg.get('auto_send_enter') else '-'}")
+        self._log_api_startup()
         self._log("---")
 
         self._engine = VoiceEngine(self.cfg, self._log)
         self._engine.start()
+
+    def _log_api_startup(self):
+        ak, sk = load_api_from_file()
+        if ak and sk:
+            masked = ak[:4] + "****" + ak[-4:] if len(ak) > 8 else "****"
+            self._log(f"🔑 百度 API: {masked}")
+        else:
+            self._log("⚠ 百度 API 未配置 — 在下方「API 配置」中填入密钥")
 
     # ── 日志 ──
     def _log(self, msg, end=""):
@@ -611,8 +757,25 @@ class MainWindow:
             self._log_text.insert(tk.END, msg + "\n")
             self._log_text.see(tk.END)
             self._log_text.configure(state="disabled")
-        # 从任何线程调用都安全
         self.root.after(0, _do)
+
+    # ── API 验证 ──
+    def _on_api_test(self):
+        ak = self._api_key_var.get().strip()
+        sk = self._api_sk_var.get().strip()
+        if not ak or not sk:
+            self._api_status_label.config(text="❌ 密钥不能为空", fg="#ff5252")
+            return
+        self._api_status_label.config(text="⏳ 验证中...", fg="#ff9800")
+        self.root.update()
+
+        err = verify_api(ak, sk)
+        if err:
+            self._api_status_label.config(text=f"❌ {err}", fg="#ff5252")
+        else:
+            self._api_status_label.config(text="✅ 连接成功", fg="#4CAF50")
+            save_api_to_file(ak, sk)
+            self._log("🔑 API 密钥已验证并保存到 api.txt")
 
     # ── 麦克风设备列表 ──
     def _get_input_devices(self):
@@ -632,12 +795,10 @@ class MainWindow:
 
     # ── 校准点击位置 ──
     def _calibrate_click(self):
-        """窗口最小化 → 用户点击 tgui_say 输入栏 → 算偏移 → 恢复窗口"""
         self._log("🎯 校准模式：请在 tgui_say 输入栏上点击一下...")
-        self.root.iconify()  # 最小化窗口
+        self.root.iconify()
         self.root.update()
 
-        # 弹一个小提示窗
         tip = tk.Toplevel(self.root)
         tip.title("校准")
         tip.geometry("360x100+400+300")
@@ -651,7 +812,6 @@ class MainWindow:
                  bg="#2b2b2b", fg="#888").pack()
         tip.update()
 
-        # 等鼠标点击
         clicked = [False]
         def on_click(event):
             if hasattr(event, 'event_type') and event.event_type == 'up':
@@ -680,12 +840,12 @@ class MainWindow:
             left, top, _, _ = cef_rect
             ox = cx - left
             oy = cy - top
-            self.cfg["click_offset_x"] = ox
-            self.cfg["click_offset_y"] = oy
-            save_config(self.cfg)
+            save_calibrate_to_file(ox, oy)
+            self._cal_ox_var.set(str(ox))
+            self._cal_oy_var.set(str(oy))
             self._log(f"✅ 校准完成: 偏移 ({ox}, {oy}) 已保存")
         else:
-            self._log("⚠ 未找到 tgui_say 窗口，已保存绝对坐标")
+            self._log("⚠ 未找到 tgui_say 窗口")
 
         self.root.deiconify()
 
@@ -790,7 +950,6 @@ class MainWindow:
 
     # ── 保存 ──
     def _on_save(self):
-        # 麦克风
         mic_label = self._mic_var.get()
         mic_id = None
         for d in self._devices:
@@ -798,7 +957,6 @@ class MainWindow:
                 mic_id = d["id"]
                 break
 
-        # PTT 键
         if self._captured_key:
             ptt_key = self._captured_key
         else:
@@ -819,14 +977,23 @@ class MainWindow:
         self.cfg["auto_send_enter"] = self._auto_enter_var.get()
 
         save_config(self.cfg)
-        self._log(f"💾 设置已保存")
+        ak = self._api_key_var.get().strip()
+        sk = self._api_sk_var.get().strip()
+        if ak and sk:
+            save_api_to_file(ak, sk)
+        # 保存偏移
+        try:
+            ox = int(self._cal_ox_var.get())
+            oy = int(self._cal_oy_var.get())
+            save_calibrate_to_file(ox, oy)
+        except ValueError:
+            pass
+        self._log("💾 设置已保存")
 
-        # 如果键位改了，通知引擎
         if old_cfg.get("ptt_key") != ptt_key or old_cfg.get("ptt_key_display") != self._key_var.get():
             self._engine.update_config(self.cfg)
             self._log(f"🔄 PTT 键已切换为: {self._key_var.get()}")
 
-        # 如果自动开关改了，也通知引擎
         if (old_cfg.get("auto_open_t") != self._auto_t_var.get()
                 or old_cfg.get("auto_send_enter") != self._auto_enter_var.get()):
             self._engine.update_config(self.cfg)
@@ -836,7 +1003,31 @@ class MainWindow:
     def _on_close(self):
         self.cfg["window_geometry"] = self.root.geometry()
         self.cfg["window_topmost"] = self._topmost_var.get()
+        # 保存 PTT 键
+        if self._captured_key:
+            ptt_key = self._captured_key
+        else:
+            display = self._key_var.get()
+            ptt_key = {"type": "special", "name": "caps_lock"}
+            for kd, kt, kn in COMMON_KEYS:
+                if kd == display:
+                    ptt_key = {"type": kt, "name": kn}
+                    break
+        self.cfg["ptt_key"] = ptt_key
+        self.cfg["ptt_key_display"] = self._key_var.get()
+        # 保存 API
+        ak = self._api_key_var.get().strip()
+        sk = self._api_sk_var.get().strip()
         save_config(self.cfg)
+        if ak and sk:
+            save_api_to_file(ak, sk)
+        # 保存偏移
+        try:
+            ox = int(self._cal_ox_var.get())
+            oy = int(self._cal_oy_var.get())
+            save_calibrate_to_file(ox, oy)
+        except ValueError:
+            pass
         self._engine.stop()
         self.root.destroy()
 
@@ -849,9 +1040,7 @@ class MainWindow:
 # ═══════════════════════════════════════════
 
 if __name__ == "__main__":
-    # 校准模式（纯命令行）
     if "--calibrate" in sys.argv:
-        # 简单校准：找窗口 → 点击 → 算偏移
         print("🎯 校准模式：按 T 打开 tgui_say，3 秒后用鼠标点击输入栏...")
         time.sleep(3)
         click_detected = [False]
@@ -873,17 +1062,10 @@ if __name__ == "__main__":
             left, top, _, _ = cef_rect
             ox = cx - left
             oy = cy - top
-            cfg = load_config()
-            cfg["click_offset_x"] = ox
-            cfg["click_offset_y"] = oy
-            save_config(cfg)
+            save_calibrate_to_file(ox, oy)
             print(f"✅ 已保存偏移: ({ox}, {oy})")
         else:
-            print("⚠ 未找到 tgui_say 窗口，已保存绝对坐标")
-            cfg = load_config()
-            cfg["click_offset_x"] = cx
-            cfg["click_offset_y"] = cy
-            save_config(cfg)
+            print("⚠ 未找到 tgui_say 窗口")
         sys.exit(0)
 
     MainWindow().run()

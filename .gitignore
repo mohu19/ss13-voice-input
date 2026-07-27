@@ -3,6 +3,10 @@ __pycache__/
 *.pyc
 *.pyo
 venv/
+
+# User config (not committed)
+api.txt
+calibrate.txt
 .env
 
 # OS
@@ -22,3 +26,8 @@ vosk-model-small-cn-0.22.zip
 
 # Logs
 *.log
+
+# PyInstaller build artifacts
+dist/
+build/
+*.spec
