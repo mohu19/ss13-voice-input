@@ -67,22 +67,35 @@ def save_config(cfg):
 
 # ── api.txt 读写 ──
 
-def load_api_from_file() -> tuple:
-    """从 api.txt 读取 API Key 和 Secret Key，返回 (ak, sk)"""
+def load_api_from_file() -> dict:
+    """从 api.txt 读取所有 API 配置，返回 dict"""
+    cfg = {"provider": "baidu", "baidu_api_key": "", "baidu_secret_key": "",
+           "iflytek_app_id": "", "iflytek_api_key": "", "iflytek_api_secret": ""}
     if not os.path.exists(API_FILE_PATH):
-        return ("", "")
+        return cfg
     try:
         with open(API_FILE_PATH, "r", encoding="utf-8") as f:
-            lines = f.read().strip().splitlines()
-        if len(lines) >= 2:
-            return (lines[0].strip(), lines[1].strip())
-        return ("", "")
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if k in cfg:
+                        cfg[k] = v
+        return cfg
     except Exception:
-        return ("", "")
+        return cfg
 
-def save_api_to_file(ak: str, sk: str):
+def save_api_to_file(api_cfg: dict):
     with open(API_FILE_PATH, "w", encoding="utf-8") as f:
-        f.write(f"{ak}\n{sk}\n")
+        f.write(f"provider={api_cfg.get('provider', 'baidu')}\n")
+        f.write(f"baidu_api_key={api_cfg.get('baidu_api_key', '')}\n")
+        f.write(f"baidu_secret_key={api_cfg.get('baidu_secret_key', '')}\n")
+        f.write(f"iflytek_app_id={api_cfg.get('iflytek_app_id', '')}\n")
+        f.write(f"iflytek_api_key={api_cfg.get('iflytek_api_key', '')}\n")
+        f.write(f"iflytek_api_secret={api_cfg.get('iflytek_api_secret', '')}\n")
 
 # ── calibrate.txt 读写 ──
 
@@ -195,6 +208,136 @@ def _vosk_asr(recognizer, audio_bytes: bytes) -> str:
         recognizer.Reset()
         return text
     except Exception:
+        return ""
+
+# ═══════════════════════════════════════════
+# 讯飞 ASR（WebSocket + HMAC-SHA256）
+# ═══════════════════════════════════════════
+
+import hmac, hashlib, base64
+from urllib.parse import urlencode, urlparse
+
+def _build_iflytek_url(app_id: str, api_key: str, api_secret: str) -> str:
+    host = "iat-api.xfyun.cn"
+    path = "/v2/iat"
+    # 强制英文 locale 确保 RFC1123 格式正确
+    import locale as _locale
+    _saved = _locale.getlocale(_locale.LC_TIME)
+    try:
+        _locale.setlocale(_locale.LC_TIME, "C")
+    except Exception:
+        pass
+    date = time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime())
+    try:
+        if _saved[0]:
+            _locale.setlocale(_locale.LC_TIME, _saved)
+    except Exception:
+        pass
+
+    signature_origin = f"host: {host}\ndate: {date}\nGET {path} HTTP/1.1"
+    signature_sha = hmac.new(api_secret.encode(), signature_origin.encode(), hashlib.sha256).digest()
+    signature = base64.b64encode(signature_sha).decode()
+
+    auth_origin = f'api_key="{api_key}", algorithm="hmac-sha256", headers="host date request-line", signature="{signature}"'
+    authorization = base64.b64encode(auth_origin.encode()).decode()
+
+    params = urlencode({"host": host, "date": date, "authorization": authorization})
+    return f"wss://{host}{path}?{params}"
+
+def _iflytek_asr(audio_bytes: bytes, app_id: str, api_key: str, api_secret: str, log_func=None) -> str:
+    if not app_id or not api_key or not api_secret:
+        if log_func: log_func("! 讯飞配置不完整")
+        return ""
+    try:
+        import websocket
+    except ImportError:
+        if log_func: log_func("! 缺少 websocket-client 库")
+        return ""
+
+    url = _build_iflytek_url(app_id, api_key, api_secret)
+    result_text = [""]
+    error_msg = [""]
+    done = [False]
+
+    def on_message(ws, msg):
+        try:
+            data = json.loads(msg)
+            if data.get("code") != 0:
+                error_msg[0] = f"讯飞错误 {data['code']}: {data.get('message', '')}"
+                done[0] = True
+                return
+            result = data.get("data", {}).get("result", {})
+            if result:
+                ws_list = result.get("ws", [])
+                words = []
+                for w in ws_list:
+                    for cw in w.get("cw", []):
+                        words.append(cw.get("w", ""))
+                result_text[0] = "".join(words)
+            if data.get("data", {}).get("status") == 2:
+                done[0] = True
+        except Exception as e:
+            error_msg[0] = f"讯飞解析错误: {e}"
+            done[0] = True
+
+    def on_error(ws, err):
+        error_msg[0] = f"讯飞 WebSocket 错误: {err}"
+        done[0] = True
+
+    def on_close(ws, status, msg):
+        if not done[0]:
+            done[0] = True
+
+    try:
+        ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
+        wst = threading.Thread(target=ws.run_forever, daemon=True)
+        wst.start()
+        time.sleep(0.5)
+
+        if not ws.sock or not ws.sock.connected:
+            error_msg[0] = "讯飞 WebSocket 连接失败"
+            ws.close()
+            done[0] = True
+            return ""
+
+        # 发送音频（快速发送，不等待帧间隔）
+        b64_audio = base64.b64encode(audio_bytes).decode()
+        frame_size = 1280
+        total = len(b64_audio)
+        sent = 0
+        first = True
+        while sent < total:
+            chunk = b64_audio[sent:sent + frame_size]
+            status = 0 if first else (2 if sent + frame_size >= total else 1)
+            payload = {"data": {"status": status, "format": "audio/L16;rate=16000",
+                                "encoding": "raw", "audio": chunk}}
+            if first:
+                payload["common"] = {"app_id": app_id}
+                payload["business"] = {"language": "zh_cn", "domain": "iat",
+                                       "accent": "mandarin", "ptt": 1}
+                first = False
+            try:
+                ws.send(json.dumps(payload))
+            except Exception as e:
+                error_msg[0] = f"讯飞发送失败: {e}"
+                done[0] = True
+                break
+            sent += frame_size
+            time.sleep(0.002)  # 极小间隔，仅让出 CPU
+
+        # 等待结果，最多15秒
+        for _ in range(150):
+            if done[0]:
+                break
+            time.sleep(0.1)
+        ws.close()
+
+        if error_msg[0]:
+            if log_func: log_func(f"! {error_msg[0]}")
+            return ""
+        return result_text[0].strip()
+    except Exception as e:
+        if log_func: log_func(f"! 讯飞 ASR 异常: {e}")
         return ""
 
 # ═══════════════════════════════════════════
@@ -406,11 +549,26 @@ class VoiceEngine:
         self.log(f"☁ 识别中 ({duration_ms:.0f}ms 音频)...", end="")
         audio_bytes = audio.tobytes()
 
-        api_key, secret_key = load_api_from_file()
-        if api_key and secret_key:
-            text = _baidu_asr(audio_bytes, api_key, secret_key, log_func=self.log)
+        api_cfg = load_api_from_file()
+        provider = api_cfg.get("provider", "baidu")
+        text = ""
+        if provider == "baidu":
+            ak = api_cfg.get("baidu_api_key", "")
+            sk = api_cfg.get("baidu_secret_key", "")
+            if ak and sk:
+                text = _baidu_asr(audio_bytes, ak, sk, log_func=self.log)
+            else:
+                self.log("⚠ 百度 API 未配置", end="")
+        elif provider == "iflytek":
+            app_id = api_cfg.get("iflytek_app_id", "")
+            ik = api_cfg.get("iflytek_api_key", "")
+            i_secret = api_cfg.get("iflytek_api_secret", "")
+            if app_id and ik and i_secret:
+                text = _iflytek_asr(audio_bytes, app_id, ik, i_secret, log_func=self.log)
+            else:
+                self.log("⚠ 讯飞 API 未配置", end="")
         else:
-            self.log("⚠ API 密钥未配置，跳过在线识别", end="")
+            self.log(f"⚠ 未知识别引擎: {provider}", end="")
 
         if not text and self._vosk_available:
             self.log(" ↻ Vosk 回退...", end="")
@@ -468,12 +626,22 @@ class VoiceEngine:
         self._thread.start()
 
     def _log_api_status(self):
-        ak, sk = load_api_from_file()
-        if ak and sk:
-            masked = ak[:4] + "****" + ak[-4:] if len(ak) > 8 else "****"
-            self.log(f"🔑 百度 API: {masked}")
-        else:
-            self.log("⚠ 百度 API 未配置 — 在「API 配置」中填入密钥启用在线识别")
+        api_cfg = load_api_from_file()
+        provider = api_cfg.get("provider", "baidu")
+        if provider == "baidu":
+            ak = api_cfg.get("baidu_api_key", "")
+            if ak:
+                masked = ak[:4] + "****" + ak[-4:] if len(ak) > 8 else "****"
+                self.log(f"🔑 百度 API: {masked}")
+            else:
+                self.log("⚠ 百度 API 未配置 — 在「API 配置」中填入密钥")
+        elif provider == "iflytek":
+            ik = api_cfg.get("iflytek_api_key", "")
+            if ik:
+                masked = ik[:4] + "****" + ik[-4:] if len(ik) > 8 else "****"
+                self.log(f"🔑 讯飞 API: {masked}")
+            else:
+                self.log("⚠ 讯飞 API 未配置 — 在「API 配置」中填入密钥")
 
     def _run(self):
         pressed = False
@@ -685,50 +853,98 @@ class MainWindow:
         save_btn.pack(side="left", padx=(0, 0))
 
         # ── API 配置区域 ──
-        api_frame = tk.LabelFrame(settings_frame, text=" API 配置 (百度短语音识别) ",
+        _api_cfg = load_api_from_file()
+        self._api_provider_var = tk.StringVar(value=_api_cfg.get("provider", "baidu"))
+        api_frame = tk.LabelFrame(settings_frame, text=" API 配置 ",
                                   font=("Microsoft YaHei", 9),
                                   bg=bg, fg="#ff9800", relief="groove", padx=8, pady=6)
         api_frame.pack(fill="x", pady=(0, 6))
 
-        api_row1 = tk.Frame(api_frame, bg=bg)
-        api_row1.pack(fill="x", pady=(0, 4))
-
-        _api_ak, _api_sk = load_api_from_file()
-        tk.Label(api_row1, text="API Key:", font=("Microsoft YaHei", 9),
+        api_row0 = tk.Frame(api_frame, bg=bg)
+        api_row0.pack(fill="x", pady=(0, 4))
+        tk.Label(api_row0, text="识别引擎:", font=("Microsoft YaHei", 9),
                  bg=bg, fg=fg, width=10, anchor="w").pack(side="left")
-        self._api_key_var = tk.StringVar(value=_api_ak)
-        api_key_entry = tk.Entry(api_row1, textvariable=self._api_key_var,
-                                 font=("Consolas", 9), width=55,
-                                 bg="#1e1e1e", fg="#e0e0e0", insertbackground="#e0e0e0",
-                                 relief="sunken", bd=2)
-        api_key_entry.pack(side="left", padx=(0, 8), ipady=2)
+        provider_combo = ttk.Combobox(api_row0, textvariable=self._api_provider_var,
+                                      values=["baidu", "iflytek"],
+                                      state="readonly", width=14)
+        provider_combo.pack(side="left")
+        provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
 
-        tk.Label(api_row1, text="申请: console.bce.baidu.com",
+        # 百度 API 字段
+        self._api_frame_baidu = tk.Frame(api_frame, bg=bg)
+        self._api_frame_baidu.pack(fill="x")
+        bd_row1 = tk.Frame(self._api_frame_baidu, bg=bg)
+        bd_row1.pack(fill="x", pady=(0, 4))
+        tk.Label(bd_row1, text="API Key:", font=("Microsoft YaHei", 9),
+                 bg=bg, fg=fg, width=10, anchor="w").pack(side="left")
+        self._baidu_ak_var = tk.StringVar(value=_api_cfg.get("baidu_api_key", ""))
+        tk.Entry(bd_row1, textvariable=self._baidu_ak_var,
+                 font=("Consolas", 9), width=50,
+                 bg="#1e1e1e", fg="#e0e0e0", insertbackground="#e0e0e0",
+                 relief="sunken", bd=2).pack(side="left", padx=(0, 8), ipady=2)
+        tk.Label(bd_row1, text="申请: console.bce.baidu.com",
                  font=("Microsoft YaHei", 8), bg=bg, fg="#888").pack(side="left")
 
-        api_row2 = tk.Frame(api_frame, bg=bg)
-        api_row2.pack(fill="x", pady=(0, 4))
-
-        tk.Label(api_row2, text="Secret Key:", font=("Microsoft YaHei", 9),
+        bd_row2 = tk.Frame(self._api_frame_baidu, bg=bg)
+        bd_row2.pack(fill="x", pady=(0, 4))
+        tk.Label(bd_row2, text="Secret Key:", font=("Microsoft YaHei", 9),
                  bg=bg, fg=fg, width=10, anchor="w").pack(side="left")
-        self._api_sk_var = tk.StringVar(value=_api_sk)
-        api_sk_entry = tk.Entry(api_row2, textvariable=self._api_sk_var,
-                                font=("Consolas", 9), width=55,
-                                bg="#1e1e1e", fg="#e0e0e0", insertbackground="#e0e0e0",
-                                relief="sunken", bd=2)
-        api_sk_entry.pack(side="left", padx=(0, 8), ipady=2)
+        self._baidu_sk_var = tk.StringVar(value=_api_cfg.get("baidu_secret_key", ""))
+        tk.Entry(bd_row2, textvariable=self._baidu_sk_var,
+                 font=("Consolas", 9), width=50,
+                 bg="#1e1e1e", fg="#e0e0e0", insertbackground="#e0e0e0",
+                 relief="sunken", bd=2).pack(side="left", padx=(0, 8), ipady=2)
 
-        api_test_btn = tk.Button(api_row2, text="验证连接",
-                                 font=("Microsoft YaHei", 9),
-                                 bg="#4CAF50", fg="white", relief="flat",
-                                 padx=12, cursor="hand2",
-                                 command=self._on_api_test)
-        api_test_btn.pack(side="left")
+        # 讯飞 API 字段
+        self._api_frame_iflytek = tk.Frame(api_frame, bg=bg)
+        if_row1 = tk.Frame(self._api_frame_iflytek, bg=bg)
+        if_row1.pack(fill="x", pady=(0, 4))
+        tk.Label(if_row1, text="APPID:", font=("Microsoft YaHei", 9),
+                 bg=bg, fg=fg, width=10, anchor="w").pack(side="left")
+        self._iflytek_appid_var = tk.StringVar(value=_api_cfg.get("iflytek_app_id", ""))
+        tk.Entry(if_row1, textvariable=self._iflytek_appid_var,
+                 font=("Consolas", 9), width=50,
+                 bg="#1e1e1e", fg="#e0e0e0", insertbackground="#e0e0e0",
+                 relief="sunken", bd=2).pack(side="left", padx=(0, 8), ipady=2)
+        tk.Label(if_row1, text="申请: xfyun.cn",
+                 font=("Microsoft YaHei", 8), bg=bg, fg="#888").pack(side="left")
 
-        self._api_status_label = tk.Label(api_row2, text="",
+        if_row2 = tk.Frame(self._api_frame_iflytek, bg=bg)
+        if_row2.pack(fill="x", pady=(0, 4))
+        tk.Label(if_row2, text="API Key:", font=("Microsoft YaHei", 9),
+                 bg=bg, fg=fg, width=10, anchor="w").pack(side="left")
+        self._iflytek_ak_var = tk.StringVar(value=_api_cfg.get("iflytek_api_key", ""))
+        tk.Entry(if_row2, textvariable=self._iflytek_ak_var,
+                 font=("Consolas", 9), width=50,
+                 bg="#1e1e1e", fg="#e0e0e0", insertbackground="#e0e0e0",
+                 relief="sunken", bd=2).pack(side="left", padx=(0, 8), ipady=2)
+
+        if_row3 = tk.Frame(self._api_frame_iflytek, bg=bg)
+        if_row3.pack(fill="x", pady=(0, 4))
+        tk.Label(if_row3, text="API Secret:", font=("Microsoft YaHei", 9),
+                 bg=bg, fg=fg, width=10, anchor="w").pack(side="left")
+        self._iflytek_secret_var = tk.StringVar(value=_api_cfg.get("iflytek_api_secret", ""))
+        tk.Entry(if_row3, textvariable=self._iflytek_secret_var,
+                 font=("Consolas", 9), width=50,
+                 bg="#1e1e1e", fg="#e0e0e0", insertbackground="#e0e0e0",
+                 relief="sunken", bd=2).pack(side="left", padx=(0, 8), ipady=2)
+
+        # 测试按钮行
+        api_test_row = tk.Frame(api_frame, bg=bg)
+        api_test_row.pack(fill="x", pady=(4, 0))
+        self._api_test_btn = tk.Button(api_test_row, text="验证连接",
+                                       font=("Microsoft YaHei", 9),
+                                       bg="#4CAF50", fg="white", relief="flat",
+                                       padx=12, cursor="hand2",
+                                       command=self._on_api_test)
+        self._api_test_btn.pack(side="left")
+        self._api_status_label = tk.Label(api_test_row, text="",
                                           font=("Microsoft YaHei", 9),
                                           bg=bg, fg="#aaa", anchor="w")
         self._api_status_label.pack(side="left", padx=(8, 0))
+
+        # 根据当前 provider 显示/隐藏对应字段
+        self._toggle_api_fields()
 
         # ── 启动引擎 ──
         ox, oy = load_calibrate_from_file()
@@ -742,13 +958,47 @@ class MainWindow:
         self._engine = VoiceEngine(self.cfg, self._log)
         self._engine.start()
 
-    def _log_api_startup(self):
-        ak, sk = load_api_from_file()
-        if ak and sk:
-            masked = ak[:4] + "****" + ak[-4:] if len(ak) > 8 else "****"
-            self._log(f"🔑 百度 API: {masked}")
+    def _build_api_cfg_from_gui(self) -> dict:
+        return {
+            "provider": self._api_provider_var.get(),
+            "baidu_api_key": self._baidu_ak_var.get().strip(),
+            "baidu_secret_key": self._baidu_sk_var.get().strip(),
+            "iflytek_app_id": self._iflytek_appid_var.get().strip(),
+            "iflytek_api_key": self._iflytek_ak_var.get().strip(),
+            "iflytek_api_secret": self._iflytek_secret_var.get().strip(),
+        }
+
+    def _toggle_api_fields(self):
+        p = self._api_provider_var.get()
+        self._api_frame_baidu.pack_forget()
+        self._api_frame_iflytek.pack_forget()
+        if p == "baidu":
+            self._api_frame_baidu.pack(fill="x")
+            self._api_test_btn.config(text="验证连接(百度)")
         else:
-            self._log("⚠ 百度 API 未配置 — 在下方「API 配置」中填入密钥")
+            self._api_frame_iflytek.pack(fill="x")
+            self._api_test_btn.config(text="验证连接(讯飞)")
+
+    def _on_provider_change(self, event=None):
+        self._toggle_api_fields()
+
+    def _log_api_startup(self):
+        api_cfg = load_api_from_file()
+        provider = api_cfg.get("provider", "baidu")
+        if provider == "baidu":
+            ak = api_cfg.get("baidu_api_key", "")
+            if ak:
+                masked = ak[:4] + "****" + ak[-4:] if len(ak) > 8 else "****"
+                self._log(f"🔑 百度 API: {masked}")
+            else:
+                self._log("⚠ 百度 API 未配置 — 在「API 配置」中填入密钥")
+        elif provider == "iflytek":
+            ik = api_cfg.get("iflytek_api_key", "")
+            if ik:
+                masked = ik[:4] + "****" + ik[-4:] if len(ik) > 8 else "****"
+                self._log(f"🔑 讯飞 API: {masked}")
+            else:
+                self._log("⚠ 讯飞 API 未配置 — 在「API 配置」中填入密钥")
 
     # ── 日志 ──
     def _log(self, msg, end=""):
@@ -761,21 +1011,31 @@ class MainWindow:
 
     # ── API 验证 ──
     def _on_api_test(self):
-        ak = self._api_key_var.get().strip()
-        sk = self._api_sk_var.get().strip()
-        if not ak or not sk:
-            self._api_status_label.config(text="❌ 密钥不能为空", fg="#ff5252")
-            return
-        self._api_status_label.config(text="⏳ 验证中...", fg="#ff9800")
-        self.root.update()
+        api_cfg = self._build_api_cfg_from_gui()
+        provider = api_cfg["provider"]
 
-        err = verify_api(ak, sk)
-        if err:
-            self._api_status_label.config(text=f"❌ {err}", fg="#ff5252")
+        if provider == "baidu":
+            ak, sk = api_cfg["baidu_api_key"], api_cfg["baidu_secret_key"]
+            if not ak or not sk:
+                self._api_status_label.config(text="❌ 百度 API Key/Secret 不能为空", fg="#ff5252")
+                return
+            self._api_status_label.config(text="⏳ 验证百度连接...", fg="#ff9800")
+            self.root.update()
+            err = verify_api(ak, sk)
+            if err:
+                self._api_status_label.config(text=f"❌ {err}", fg="#ff5252")
+            else:
+                self._api_status_label.config(text="✅ 百度连接成功", fg="#4CAF50")
+                save_api_to_file(api_cfg)
+                self._log("🔑 百度 API 已验证并保存")
         else:
-            self._api_status_label.config(text="✅ 连接成功", fg="#4CAF50")
-            save_api_to_file(ak, sk)
-            self._log("🔑 API 密钥已验证并保存到 api.txt")
+            # 讯飞只检查配置完整性，不实际调用（WebSocket 鉴权在发送时校验）
+            if not api_cfg["iflytek_app_id"] or not api_cfg["iflytek_api_key"] or not api_cfg["iflytek_api_secret"]:
+                self._api_status_label.config(text="❌ 讯飞 APPID/Key/Secret 不能为空", fg="#ff5252")
+                return
+            self._api_status_label.config(text="✅ 讯飞配置已保存（实际连接在说话时验证）", fg="#4CAF50")
+            save_api_to_file(api_cfg)
+            self._log("🔑 讯飞 API 配置已保存")
 
     # ── 麦克风设备列表 ──
     def _get_input_devices(self):
@@ -977,10 +1237,8 @@ class MainWindow:
         self.cfg["auto_send_enter"] = self._auto_enter_var.get()
 
         save_config(self.cfg)
-        ak = self._api_key_var.get().strip()
-        sk = self._api_sk_var.get().strip()
-        if ak and sk:
-            save_api_to_file(ak, sk)
+        api_cfg = self._build_api_cfg_from_gui()
+        save_api_to_file(api_cfg)
         # 保存偏移
         try:
             ox = int(self._cal_ox_var.get())
@@ -1016,11 +1274,9 @@ class MainWindow:
         self.cfg["ptt_key"] = ptt_key
         self.cfg["ptt_key_display"] = self._key_var.get()
         # 保存 API
-        ak = self._api_key_var.get().strip()
-        sk = self._api_sk_var.get().strip()
+        api_cfg = self._build_api_cfg_from_gui()
         save_config(self.cfg)
-        if ak and sk:
-            save_api_to_file(ak, sk)
+        save_api_to_file(api_cfg)
         # 保存偏移
         try:
             ox = int(self._cal_ox_var.get())

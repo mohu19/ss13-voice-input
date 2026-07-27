@@ -6,8 +6,8 @@
     "name": "caps_lock"
   },
   "ptt_key_display": "CapsLock",
-  "window_geometry": "680x525+653+194",
+  "window_geometry": "680x801+658+222",
   "window_topmost": true,
   "auto_open_t": true,
-  "auto_send_enter": true
+  "auto_send_enter": false
 }

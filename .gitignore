@@ -1,4 +1,4 @@
-# User config (not committed)
+# User config
 api.txt
 calibrate.txt
 .env
@@ -14,3 +14,4 @@ Thumbs.db
 *.log
 build/
 *.spec
+vosk-model-small-cn-0.22/
