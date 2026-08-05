@@ -1,4 +1,9 @@
 @echo off
-cd /d "C:\Users\33922\Desktop\Hermes\ss13-voice"
-venv\Scripts\python.exe -u setup_api.py
+cd /d "%~dp0"
+if not exist ".venv\Scripts\python.exe" (
+    echo [ERROR] venv not found. Run 安装依赖.bat first.
+    pause
+    exit /b 1
+)
+".venv\Scripts\python.exe" -u setup_api.py
 pause
